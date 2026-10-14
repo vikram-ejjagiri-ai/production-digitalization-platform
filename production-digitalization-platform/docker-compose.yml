@@ -1,0 +1,200 @@
+# =====================================================================
+# Production digitalization platform - the whole system in one file.
+# Start everything with start.bat (Windows) / ./start.sh (Mac/Linux),
+# or:  docker compose up -d --build
+#
+# Start-up order (enforced with depends_on conditions):
+#   timescaledb + mosquitto  ->  data-prep (once)  ->  trainer (once)
+#   -> ingestion -> anomaly-detection -> simulators -> kpi-engine / ai-advisor -> grafana
+# =====================================================================
+name: production-digitalization
+
+x-python: &python
+  build:
+    context: .
+    dockerfile: docker/python.Dockerfile
+  image: production-digitalization/python:latest
+  environment: &env
+    DB_HOST: timescaledb
+    DB_PORT: "5432"
+    DB_NAME: factory
+    DB_USER: factory
+    DB_PASSWORD: ${DB_PASSWORD:-factory}
+    MQTT_HOST: mosquitto
+    MQTT_PORT: "1883"
+    DATA_DIR: /app/data
+    MODEL_DIR: /app/models
+    REPORT_DIR: /app/reports
+    KNOWLEDGE_DIR: /app/knowledge_base
+    DATASET: ${DATASET:-metropt3}
+    COMMISSIONING_END: ${COMMISSIONING_END:-2020-03-01}
+    REPLAY_SPEED: ${REPLAY_SPEED:-60}
+    LIVE_START: ${LIVE_START:-auto}
+    LINE_TIME_SCALE: ${LINE_TIME_SCALE:-1}
+    KPI_BUCKET_MINUTES: ${KPI_BUCKET_MINUTES:-15}
+    LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+    OLLAMA_URL: http://ollama:11434
+    OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:1.5b}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-5-5}
+    SUMMARY_INTERVAL_MIN: ${SUMMARY_INTERVAL_MIN:-15}
+    TZ: UTC
+  volumes:
+    - ./data:/app/data
+    - ./models:/app/models
+    - ./reports:/app/reports
+    - ./knowledge_base:/app/knowledge_base:ro
+  restart: unless-stopped
+
+services:
+  # ------------------------------------------------------------ infrastructure
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: factory
+      POSTGRES_USER: factory
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-factory}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"          # Power BI / Excel / DBeaver connect here
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U factory -d factory"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    ports:
+      - "1883:1883"          # connect MQTT Explorer here to watch live messages
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -t '$$SYS/broker/uptime' -C 1 -W 5"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+  # ------------------------------------------------------------ one-time pipeline steps
+  data-prep:
+    <<: *python
+    command: ["python", "-m", "pipeline.data_prep.prep"]
+    restart: "no"
+
+  trainer:
+    <<: *python
+    command: ["python", "-m", "pipeline.training.train"]
+    restart: "no"
+    depends_on:
+      data-prep:
+        condition: service_completed_successfully
+
+  # ------------------------------------------------------------ live services
+  ingestion:
+    <<: *python
+    command: ["python", "-m", "services.ingestion.ingest"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+
+  anomaly-detection:
+    <<: *python
+    command: ["python", "-m", "services.anomaly_detection.detector"]
+    depends_on:
+      trainer:
+        condition: service_completed_successfully
+      timescaledb:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+
+  sensor-replay:
+    <<: *python
+    command: ["python", "-m", "simulators.sensor_replay.replay"]
+    depends_on:
+      data-prep:
+        condition: service_completed_successfully
+      ingestion:
+        condition: service_started
+      anomaly-detection:
+        condition: service_started
+
+  line-simulator:
+    <<: *python
+    command: ["python", "-m", "simulators.line_simulator.line_sim"]
+    depends_on:
+      ingestion:
+        condition: service_started
+      mosquitto:
+        condition: service_healthy
+
+  kpi-engine:
+    <<: *python
+    command: ["python", "-m", "services.kpi_engine.engine"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+  ai-advisor:
+    <<: *python
+    command: ["python", "-m", "services.ai_advisor.advisor"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+  # ------------------------------------------------------------ local LLM (profile "llm", on by default via .env)
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["llm"]
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+    restart: unless-stopped
+
+  ollama-init:
+    image: ollama/ollama:latest
+    profiles: ["llm"]
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama pull $${MODEL} && echo 'Model ready'"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      MODEL: ${OLLAMA_MODEL:-qwen2.5:1.5b}
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+  # ------------------------------------------------------------ dashboards
+  grafana:
+    image: grafana/grafana-oss:11.4.0-ubuntu
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/shopfloor.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  ollama-data:

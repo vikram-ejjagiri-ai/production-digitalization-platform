@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+data/raw/*
+data/split/*
+models/*
+reports/*
+!*/.gitkeep
+!data/raw/.gitkeep
+!data/split/.gitkeep
